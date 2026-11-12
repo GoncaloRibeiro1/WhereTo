@@ -37,6 +37,9 @@ there, and so on. If the car drove through a crossing without turning, say
     --turn right left              right here, left at the next crossing
     --turn right straight left     right, straight through one, then left
 
+At a fork (the road splits in two, both branches roughly straight ahead) say
+"left" for keep left and "right" for keep right.
+
 Usage
 -----
 Real map (needs internet access to OpenStreetMap):
@@ -288,9 +291,24 @@ def crossroads_classes(G, X, came_from, in_bearing):
     return {vl: "left", vm: "straight", vr: "right"}
 
 
+def fork_classes(exits):
+    """
+    A fork (Y-junction): exactly two roads leave X and both are nearly
+    straight ahead, e.g. Antero de Quental splitting into Vale Formoso (-9°)
+    and its own one-way branch (+9°). The angle rule calls both 'straight',
+    which would make the observation useless; drivers say 'keep left' /
+    'keep right', so the left branch is 'left' and the right one 'right'.
+    Returns the regrouped exits, or None if X is not such a fork.
+    """
+    if set(exits) != {"straight"} or len(exits["straight"]) != 2:
+        return None
+    left, right = sorted(exits["straight"], key=lambda e: e[2])
+    return defaultdict(list, left=[left], right=[right])
+
+
 def exits_by_turn(G, X, came_from, in_bearing):
     """Group the roads leaving X into 'left' / 'right' / 'straight'.
-    Returns (exits, kind), kind = 'crossroads' or 'angles'."""
+    Returns (exits, kind), kind = 'crossroads', 'fork' or 'angles'."""
     by_position = crossroads_classes(G, X, came_from, in_bearing)
     exits = defaultdict(list)       # class -> list of (v, travel_time, delta, data)
     for _, v, k, data in G.out_edges(X, keys=True, data=True):
@@ -306,7 +324,12 @@ def exits_by_turn(G, X, came_from, in_bearing):
         else:
             cls = "right" if delta > 0 else "left"
         exits[cls].append((v, data["travel_time"], delta, data))
-    return exits, ("crossroads" if by_position else "angles")
+    if by_position is not None:
+        return exits, "crossroads"
+    fork = fork_classes(exits)
+    if fork is not None:
+        return fork, "fork"
+    return exits, "angles"
 
 
 def turn_likelihood(G, exits, observed_turn, beta, nodes):
@@ -375,8 +398,10 @@ def destination_posterior(G, X, heading, turns, beta, trip_scale=None):
                 print(f"    {cls:<8} {road_name(data)} ({delta:+.0f}°)")
         print(f"  -> turned {turn}")
         if turn not in exits:
+            hint = (" (this is a fork: use 'left' / 'right' for keep left / "
+                    "keep right)" if kind == "fork" else "")
             raise ValueError(f"No '{turn}' exit at crossing {k} {X}; "
-                             f"available: {sorted(exits)}")
+                             f"available: {sorted(exits)}{hint}")
         steps.append((X, exits, turn))
 
         # Drive to the next crossing along the road that was taken
