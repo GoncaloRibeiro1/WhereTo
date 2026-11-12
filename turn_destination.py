@@ -95,8 +95,6 @@ PORTO_PLACES = [
     "Porto, Portugal",
     "Matosinhos, Portugal",
     "Maia, Portugal",
-    "Vila Nova de Gaia, Portugal",
-    "Gondomar, Portugal",
 ]
 
 
