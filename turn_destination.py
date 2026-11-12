@@ -13,8 +13,11 @@ Model (Bayes' rule):
         posterior                  likelihood                       prior
 
   prior       P(d)        how likely d is as a destination before seeing any
-                          turn. Default: every intersection equally likely;
-                          optionally favour shorter trips (--trip-scale).
+                          turn. Default: every intersection equally likely.
+                          With --landmarks: most of it on intersections near
+                          hospitals, universities, malls, stations, ... (see
+                          LANDMARKS for the weights), plus a uniform floor.
+                          Optionally favour shorter trips (--trip-scale).
   likelihood  P(turn | d) if the driver were going to d, how likely is this
                           turn at this crossing? A "noisy rational driver":
                           for each exit road compute the fastest time to d if
@@ -57,13 +60,29 @@ Cached city graph (download once, then reuse offline):
         --lon -8.5989 --heading 0 --turn right right
 
   --build-graph downloads the roads of --places (default: Porto, Matosinhos,
-  Maia, Vila Nova de Gaia, Gondomar) and saves them; --graph loads that file
-  instead of downloading, and --radius is then ignored.
+  Maia) and saves them; --graph loads that file instead of downloading, and
+  --radius is then ignored.
+
+Landmark prior (download once, then reuse):
+    python turn_destination.py --build-landmarks porto_landmarks.geojson
+    python turn_destination.py --graph porto.graphml \
+        --landmarks porto_landmarks.geojson --lat 41.1622 --lon -8.5989 \
+        --heading 0 --turn right right
+
+  Also prints the most likely named places and writes them to *_places.csv.
+  --landmark-floor (default 0.2) is the share of the prior kept uniform;
+  --landmark-sigma (default 100 m) is how far a landmark reaches.
+
+  --time HH:MM (or now) and --day (weekday, monday ... sunday) weight each
+  kind of landmark by how busy it is then (PROFILES): universities, offices
+  and schools in the morning, malls and homes in the evening, few offices
+  at the weekend.
 
 Offline demo (synthetic city grid, no internet needed):
     python turn_destination.py --demo --turn right left
 
-Outputs: a PNG heatmap and a CSV of regions ranked by probability.
+Outputs: a PNG heatmap and a CSV of regions ranked by probability (and, with
+landmarks, a CSV of places ranked by probability).
 
 Requires: pip install osmnx networkx matplotlib numpy
 """
@@ -187,6 +206,328 @@ def make_demo_graph(n=20, spacing=150.0):
                 G.add_edge(b, a, length=spacing, travel_time=tt)
     G.graph["demo"] = True
     return G, (n // 2, n // 2)
+
+
+# ----------------------------------------------------------------------------
+# Landmarks: the destination prior P(d)
+# ----------------------------------------------------------------------------
+# OSM tag -> (weight, typical area in m²). The weight is roughly how many car
+# trips a day end at one typical place of that kind, relative to the others.
+# A polygon bigger or smaller than typical has its weight scaled by
+# sqrt(area / typical area), clipped to SIZE_FACTOR; None = no size scaling.
+# `True` matches any value of that key (every office=*).
+LANDMARKS = {
+    ("aeroway", "terminal"):        (100, 40_000),
+    ("amenity", "hospital"):        (60, 30_000),
+    ("amenity", "university"):      (40, 20_000),
+    ("shop", "mall"):               (40, 20_000),
+    ("leisure", "stadium"):         (20, None),
+    ("railway", "station"):         (10, None),
+    ("amenity", "college"):         (10, 5_000),
+    ("shop", "department_store"):   (10, None),
+    ("amenity", "marketplace"):     (8, None),
+    ("shop", "supermarket"):        (8, 1_500),
+    ("amenity", "school"):          (6, 5_000),
+    ("office", True):               (2, None),
+    ("amenity", "parking"):         (1, 1_000),
+}
+SIZE_FACTOR = (0.25, 3)
+
+
+def _category(key, value):
+    return key if value is True else f"{key}={value}"
+
+
+CATEGORY_WEIGHTS = {_category(k, v): wt for (k, v), wt in LANDMARKS.items()}
+
+# When do car trips arrive at each kind of place? (--time / --day)
+# name -> (24 values, one per hour 0h..23h on a weekday, relative shape only:
+#          they are rescaled to average 1 over the day;
+#          Saturday and Sunday daily volume relative to a weekday)
+# Hand-made shapes from common sense, not measured data: tune freely.
+PROFILES = {
+    #             0    1    2    3    4    5    6    7    8    9   10   11
+    #            12   13   14   15   16   17   18   19   20   21   22   23
+    "work":     ([.05, .05, .05, .05, .05, .05, .4,  2.5, 5,   4,   1.5, .8,
+                  .6,  1.8, 1.5, .6,  .4,  .3,  .2,  .1,  .05, .05, .05, .05],
+                 0.15, 0.05),
+    "study":    ([.02, .02, .02, .02, .02, .02, .1,  1.5, 4,   3.5, 2.5, 2,
+                  1,   2,   2.5, 1.2, .8,  .6,  .5,  .3,  .1,  .02, .02, .02],
+                 0.1, 0.03),
+    # drop-off in the morning, pick-up in the afternoon
+    "school":   ([.01, .01, .01, .01, .01, .01, .05, 2,   8,   1,   .3,  .3,
+                  .5,  1,   .5,  .5,  1.5, 2,   1,   .2,  .05, .01, .01, .01],
+                 0.02, 0.01),
+    # staff shifts and appointments in the morning, visits later, ER at night
+    "hospital": ([.3,  .3,  .3,  .3,  .3,  .3,  1,   3,   3.5, 3,   2.2, 1.6,
+                  1,   1.2, 1.8, 1.5, 1.2, 1,   1,   1,   .8,  .4,  .4,  .4],
+                 0.5, 0.4),
+    "shopping": ([.02, .02, .02, .02, .02, .02, .02, .02, .02, .3,  .8,  1.2,
+                  1.6, 1.5, 1.3, 1.4, 1.6, 2,   2.2, 2.2, 1.8, 1,   .4,  .05],
+                 1.4, 1.1),
+    "groceries": ([.02, .02, .02, .02, .02, .02, .02, .3,  .8,  1.2, 1.4, 1.5,
+                   1.4, 1.1, 1,   1.1, 1.4, 1.9, 2.2, 2,   1.4, .6,  .1,  .02],
+                  1.3, 0.8),
+    "market":   ([.02, .02, .02, .02, .02, .02, .5,  1.5, 2.5, 3,   3,   2.5,
+                  1.5, .8,  .5,  .5,  .5,  .5,  .3,  .1,  .02, .02, .02, .02],
+                 1.2, 0.2),
+    # drop-offs and park & ride: mostly the morning commute
+    "station":  ([.05, .05, .05, .05, .05, .3,  1,   3,   3.5, 1.5, .8,  .8,
+                  .8,  .8,  .8,  .8,  1.2, 2,   2,   1.2, .6,  .3,  .3,  .3],
+                 0.6, 0.5),
+    "airport":  ([.2,  .2,  .2,  .2,  1,   2,   2,   1.2, 1.2, 1.2, 1.2, 1.2,
+                  1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1,   .8,  .5],
+                 1.0, 1.0),
+    "events":   ([.05, .05, .05, .05, .05, .05, .05, .05, .05, .5,  .5,  .5,
+                  .5,  .5,  .5,  .5,  .5,  1,   2,   3,   3,   1.5, .5,  .1],
+                 2.5, 2.5),
+    # car parks serve everything: a blend of commute and shopping
+    "general":  ([.1,  .1,  .1,  .1,  .1,  .1,  .5,  1.5, 2.2, 1.8, 1.2, 1.1,
+                  1.1, 1.3, 1.3, 1.1, 1.2, 1.4, 1.5, 1.3, .9,  .6,  .4,  .2],
+                 0.8, 0.5),
+    # homes: people coming back for lunch and in the evening
+    "home":     ([.6,  .3,  .15, .15, .15, .15, .2,  .3,  .4,  .4,  .5,  .6,
+                  1.2, 1,   .7,  .8,  1.2, 1.8, 2.5, 2.8, 2.2, 1.5, 1.2, .9],
+                 1.0, 1.1),
+}
+CATEGORY_PROFILE = {
+    "aeroway=terminal": "airport", "amenity=hospital": "hospital",
+    "amenity=university": "study", "amenity=college": "study",
+    "shop=mall": "shopping", "shop=department_store": "shopping",
+    "leisure=stadium": "events", "railway=station": "station",
+    "amenity=marketplace": "market", "shop=supermarket": "groceries",
+    "amenity=school": "school", "office": "work", "amenity=parking": "general",
+}
+# The uniform floor stands for everything that is not a landmark: homes, but
+# also most workplaces and small shops (only a fraction are in OSM), so it
+# follows a blend of the home and general-traffic profiles.
+FLOOR_PROFILE = {"home": 0.5, "general": 0.5}
+DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+        "sunday"]
+
+
+def activity(profile, day, hour):
+    """How busy `profile` is at `hour` (0-24, fractional) on `day` (a name in
+    DAYS, or None = any day), relative to an average hour of an average
+    weekday. hour=None gives the whole-day factor only."""
+    values, sat, sun = PROFILES[profile]
+    day_factor = {"saturday": sat, "sunday": sun}.get(day, 1.0)
+    if hour is None:
+        return day_factor
+    v = np.asarray(values, float)
+    v /= v.mean()
+    # Each value is for the hour starting at h, i.e. centred on h + 0.5;
+    # interpolate between centres, wrapping around midnight.
+    centres = np.arange(-0.5, 25.5)
+    return day_factor * float(np.interp(hour, centres,
+                                        np.concatenate([v[-1:], v, v[:1]])))
+
+
+def parse_when(time_str, day):
+    """--time / --day -> (day name or None, hour as float or None)."""
+    if time_str == "now":
+        import datetime
+        now = datetime.datetime.now()
+        return day or DAYS[now.weekday()], now.hour + now.minute / 60
+    hour = None
+    if time_str:
+        h, _, m = time_str.partition(":")
+        hour = int(h) + int(m or 0) / 60
+        if not 0 <= hour < 24:
+            raise ValueError(f"--time {time_str}: expected HH:MM")
+    return day, hour
+
+
+def build_landmarks(places, path):
+    """Download the LANDMARKS of `places` from OSM and save them (name,
+    category, area, outline in lon/lat) as GeoJSON for --landmarks."""
+    import geopandas as gpd
+    import osmnx as ox
+    print(f"Downloading landmarks for: {'; '.join(places)} ...")
+    # The exact municipal outline makes the Overpass query too large (HTTP 413),
+    # so query its convex hull; landmarks far from any road are dropped later.
+    area = ox.geocode_to_gdf(places).union_all().convex_hull
+    tags = defaultdict(list)
+    for key, value in LANDMARKS:
+        if value is True:
+            tags[key] = True
+        else:
+            tags[key].append(value)
+    out = landmarks_table(ox.features_from_polygon(area, dict(tags)))
+    out.to_file(path, driver="GeoJSON")
+    print(f"Saved {len(out)} landmarks to {path}:")
+    for c, n in out["category"].value_counts().items():
+        print(f"    {n:5d}  {c}")
+    return out
+
+
+def landmarks_table(gdf):
+    """OSM features (from osmnx) -> GeoDataFrame of name, category, area_m2."""
+    import geopandas as gpd
+    gdf = gdf[gdf.geometry.geom_type.isin(["Point", "Polygon", "MultiPolygon"])]
+
+    def best_category(row):
+        """A feature can carry several tags; keep the heaviest category."""
+        cats = [_category(k, v) for k, v in LANDMARKS
+                if k in row and isinstance(row[k], str)
+                and (v is True or row[k] == v)]
+        return max(cats, key=lambda c: CATEGORY_WEIGHTS[c][0]) if cats else None
+
+    cat = gdf.apply(best_category, axis=1)
+    gdf = gdf[cat.notna()]
+    out = gpd.GeoDataFrame(
+        {"name": gdf["name"].fillna("").values if "name" in gdf else "",
+         "category": cat[cat.notna()].values,
+         "area_m2": gdf.geometry.to_crs(gdf.estimate_utm_crs()).area.round().values},
+        geometry=gdf.geometry.values, crs=gdf.crs)
+    return _drop_nested(out)
+
+
+def _drop_nested(lm):
+    """
+    Drop a polygon that is mostly (> 50%) covered by other polygons of the
+    same category, so a place is not counted twice: a university building
+    inside a university campus, or an umbrella like "Universidade do Porto",
+    one multipolygon made of all the faculties that are also mapped one by one.
+
+    Largest first, counting only polygons not dropped yet as cover: the
+    umbrella is dropped (its faculties cover it) and the faculties then stay;
+    a campus stays and the building inside it is dropped; of two identical
+    outlines one stays.
+    """
+    import shapely
+    utm = lm.geometry.to_crs(lm.estimate_utm_crs()).values
+    drop = np.zeros(len(lm), bool)
+    for cat in lm["category"].unique():
+        idx = np.flatnonzero((lm["category"] == cat).values
+                             & (lm["area_m2"] > 0).values)
+        if len(idx) < 2:
+            continue
+        geoms = utm[idx]
+        tree = shapely.STRtree(geoms)
+        for i in np.argsort(-shapely.area(geoms)):
+            near = [j for j in tree.query(geoms[i], predicate="intersects")
+                    if j != i and not drop[idx[j]]]
+            if not near:
+                continue
+            covered = shapely.area(shapely.intersection(
+                geoms[i], shapely.union_all(geoms[near])))
+            if covered > 0.5 * shapely.area(geoms[i]):
+                drop[idx[i]] = True
+    if drop.any():
+        print(f"Dropped {drop.sum()} landmarks nested in others of the same "
+              f"kind, e.g. {', '.join(sorted(set(lm['name'][drop]) - {''})[:4])}")
+    return lm[~drop].reset_index(drop=True)
+
+
+class LandmarkPrior:
+    """
+    P(d) from landmarks. Each landmark's weight is spread over the
+    intersections around it with a Gaussian kernel (sigma metres, distance
+    measured from the landmark's outline, so a big campus feeds every road
+    around it), then mixed with a uniform `floor` so places without a
+    landmark (homes, small shops) stay possible:
+
+        P(d) = (1 - floor) * landmark_mass(d) + floor / N
+
+    With `when` = (day, hour) (see parse_when), each landmark's weight is
+    multiplied by how busy its kind of place is then (PROFILES), and the
+    floor by FLOOR_PROFILE, before normalising: at 8:30 on a weekday
+    universities and offices gain, homes and malls lose; at 19:00 the reverse.
+    """
+
+    def __init__(self, G, path, sigma=100.0, floor=0.2, when=(None, None)):
+        import geopandas as gpd
+        import shapely
+        self.crs = G.graph["crs"]
+        lm = gpd.read_file(path).to_crs(self.crs)
+        unknown = set(lm["category"]) - set(CATEGORY_WEIGHTS)
+        if unknown:
+            raise ValueError(f"{path}: unknown categories {sorted(unknown)}; "
+                             f"rebuild it with --build-landmarks")
+        self.names = lm["name"].fillna("").tolist()
+        self.categories = lm["category"].tolist()
+        self.points = shapely.get_coordinates(
+            lm.geometry.representative_point())          # for the map labels
+        self.weights = np.array([self._weight(c, a) for c, a
+                                 in zip(lm["category"], lm["area_m2"])])
+        self.floor = floor
+
+        self.nodes = list(G.nodes)
+        self.index = {n: i for i, n in enumerate(self.nodes)}
+        pts = shapely.points([G.nodes[n]["x"] for n in self.nodes],
+                             [G.nodes[n]["y"] for n in self.nodes])
+        tree = shapely.STRtree(pts)
+        geoms = lm.geometry.values
+        # (landmark, node) pairs within 3 sigma, weighted by the kernel
+        li, ni = tree.query(geoms, predicate="dwithin", distance=3 * sigma)
+        k = np.exp(-0.5 * (shapely.distance(geoms[li], pts[ni]) / sigma) ** 2)
+        # Landmarks with no intersection that close: nearest one within 500 m
+        lonely = np.setdiff1d(np.arange(len(geoms)), li)
+        mi, mn = tree.query_nearest(geoms[lonely], max_distance=500)
+        li = np.concatenate([li, lonely[mi]])
+        ni = np.concatenate([ni, mn])
+        k = np.concatenate([k, np.ones(len(mi))])
+        # Each landmark's weight is spread in full, however many nodes it reaches
+        k_sum = np.bincount(li, weights=k, minlength=len(geoms))
+        self.pair_l, self.pair_n = li, ni
+        self.pair_share = k / k_sum[li]
+        self.weights[k_sum == 0] = 0                     # outside the map
+
+        # Time of day: scale each landmark, and the floor, by its activity
+        day, hour = when
+        factor = {p: activity(p, day, hour) for p in PROFILES}
+        w_now = self.weights * np.array([factor[CATEGORY_PROFILE[c]]
+                                         for c in self.categories])
+        lm_share = (1 - floor) * w_now.sum() / self.weights.sum()
+        floor_share = floor * sum(s * factor[p] for p, s in FLOOR_PROFILE.items())
+        total = lm_share + floor_share
+        self.floor_share = floor_share / total     # share of P(d) off-landmark
+
+        self.pair_mass = lm_share / total * w_now[li] / w_now.sum() * self.pair_share
+        self.prior = np.full(len(self.nodes), self.floor_share / len(self.nodes))
+        np.add.at(self.prior, ni, self.pair_mass)
+        print(f"Landmark prior: {int((self.weights > 0).sum())} landmarks, "
+              f"{1 - self.floor_share:.0%} of P(d) on landmarks, "
+              f"{self.floor_share:.0%} uniform")
+        if day is not None or hour is not None:
+            when_s = day or "weekday"
+            if hour is not None:
+                when_s += " %02d:%02d" % divmod(round(hour * 60), 60)
+            busy = sorted(factor.items(), key=lambda kv: -kv[1])
+            print(f"  {when_s}: " + ", ".join(f"{p} x{f:.2f}" for p, f in busy))
+
+    @staticmethod
+    def _weight(category, area):
+        w, typical = CATEGORY_WEIGHTS[category]
+        if typical and area and area > 0:
+            w *= float(np.clip(math.sqrt(area / typical), *SIZE_FACTOR))
+        return w
+
+    def node_prior(self):
+        """{node: P(d = node)}, summing to 1."""
+        return dict(zip(self.nodes, self.prior))
+
+    def label(self, i):
+        name = self.names[i] or "unnamed"
+        return f"{name} ({self.categories[i]})"
+
+    def rank(self, post):
+        """
+        P(the car is going to landmark i | turns). Each node's posterior is
+        shared among the landmarks in proportion to how much of that node's
+        prior each one contributed; the uniform floor's share is returned as
+        'elsewhere'. Returns ([(i, p), ...] best first, p_elsewhere).
+        """
+        p_node = np.zeros(len(self.nodes))
+        for n, p in post.items():
+            p_node[self.index[n]] = p
+        ratio = p_node / self.prior                       # posterior / prior
+        p_lm = np.bincount(self.pair_l, weights=self.pair_mass * ratio[self.pair_n],
+                           minlength=len(self.weights))
+        elsewhere = float((self.floor_share / len(self.nodes) * ratio).sum())
+        order = np.argsort(-p_lm)
+        return [(int(i), float(p_lm[i])) for i in order if p_lm[i] > 0], elsewhere
 
 
 # ----------------------------------------------------------------------------
@@ -377,9 +718,12 @@ def pick_exit(exits, turn):
     return choice
 
 
-def destination_posterior(G, X, heading, turns, beta, trip_scale=None):
+def destination_posterior(G, X, heading, turns, beta, trip_scale=None,
+                          base_prior=None):
     """
     Follow the car through the observed `turns`, starting at crossing X.
+    `base_prior` is {node: P(d)} (e.g. LandmarkPrior.node_prior()); None means
+    every intersection is equally likely.
 
     Returns ({node: P(dest = node | turns)}, path), where path is the list
     of nodes the car passed through, starting with the road it arrived on.
@@ -425,12 +769,14 @@ def destination_posterior(G, X, heading, turns, beta, trip_scale=None):
         if first_best is None:
             first_best = best
 
-    # Prior P(d): uniform, or favour trips of about `trip_scale` seconds
-    # (trip time measured from the first crossing).
+    # Prior P(d): uniform or from landmarks, optionally times a preference for
+    # trips of about `trip_scale` seconds (measured from the first crossing).
     reachable = np.isfinite(first_best)
     prior = np.where(reachable, 1.0, 0.0)
+    if base_prior is not None:
+        prior *= np.array([base_prior[d] for d in nodes])
     if trip_scale:
-        prior[reachable] = np.exp(-first_best[reachable] / trip_scale)
+        prior[reachable] *= np.exp(-first_best[reachable] / trip_scale)
 
     post = likelihood * prior
     if post.sum() == 0:
@@ -476,7 +822,33 @@ def write_csv(cells, cell_m, path):
     return rows
 
 
-def plot(G, path_nodes, post, cells, cell_m, turns, path):
+def write_places_csv(landmarks, ranked, elsewhere, path):
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["rank", "probability", "cumulative", "name", "category",
+                    "lat", "lon"])
+        cum = 0.0
+        lonlat = _to_lonlat(landmarks, [i for i, _ in ranked])
+        for rank, ((i, p), (lon, lat)) in enumerate(zip(ranked, lonlat), 1):
+            cum += p
+            w.writerow([rank, f"{p:.6f}", f"{cum:.4f}", landmarks.names[i],
+                        landmarks.categories[i], f"{lat:.6f}", f"{lon:.6f}"])
+        w.writerow(["", f"{elsewhere:.6f}", "", "(elsewhere: no landmark)",
+                    "", "", ""])
+
+
+def _to_lonlat(landmarks, idx):
+    """Landmark label points (projected) back to lon/lat."""
+    import pyproj
+    if not idx:
+        return []
+    tr = pyproj.Transformer.from_crs(landmarks.crs, "EPSG:4326", always_xy=True)
+    xy = landmarks.points[idx]
+    return list(zip(*tr.transform(xy[:, 0], xy[:, 1])))
+
+
+def plot(G, path_nodes, post, cells, cell_m, turns, path, places=()):
+    """`places` = [(x, y, label), ...]: top landmarks to mark on the map."""
     fig, ax = plt.subplots(figsize=(9, 9))
 
     # Region heatmap
@@ -492,7 +864,7 @@ def plot(G, path_nodes, post, cells, cell_m, turns, path):
     im = ax.imshow(grid, origin="lower", extent=extent, cmap="magma_r",
                    alpha=0.75, interpolation="nearest")
     cb = fig.colorbar(im, ax=ax, shrink=0.75)
-    cb.set_label(f"P(destination in region | turned {', '.join(turns)})")
+    cb.set_label("P(destination in region | turns)")
 
     # Roads (one LineCollection: much faster than one plot() per edge on a
     # city-sized graph)
@@ -515,17 +887,40 @@ def plot(G, path_nodes, post, cells, cell_m, turns, path):
                     textcoords="offset points", xytext=(7, 7),
                     color="tab:blue", fontweight="bold", zorder=6)
 
+    # Everything interesting, to zoom the map to it
+    xs = [G.nodes[n]["x"] for n in path_nodes]
+    ys = [G.nodes[n]["y"] for n in path_nodes]
+
     # Outline the smallest set of regions holding 50% of the probability
     cum = 0.0
     for (cx, cy), c in sorted(cells.items(), key=lambda kv: -kv[1]["p"]):
         ax.add_patch(plt.Rectangle((cx * cell_m, cy * cell_m), cell_m, cell_m,
                                    fill=False, ec="tab:green", lw=1.5, zorder=3))
+        xs += [cx * cell_m, (cx + 1) * cell_m]
+        ys += [cy * cell_m, (cy + 1) * cell_m]
         cum += c["p"]
         if cum >= 0.5:
             break
 
+    # Most likely landmarks: numbered stars, names in a legend
+    for rank, (x, y, label) in enumerate(places, 1):
+        ax.plot(x, y, "*", color="tab:red", ms=16, mec="white", zorder=7,
+                label=f"{rank}. {label}")
+        ax.annotate(str(rank), (x, y), textcoords="offset points",
+                    xytext=(6, 6), color="tab:red", fontweight="bold", zorder=8)
+        xs.append(x)
+        ys.append(y)
+    if places:
+        ax.legend(loc="upper left", fontsize=7, title="Most likely places",
+                  title_fontsize=8, framealpha=0.85)
+
+    pad = 800
+    ax.set_xlim(max(min(xs) - pad, extent[0]), min(max(xs) + pad, extent[1]))
+    ax.set_ylim(max(min(ys) - pad, extent[2]), min(max(ys) + pad, extent[3]))
+    route = (f"turned {' then '.join(turns)}" if len(turns) <= 6
+             else f"{len(turns)} observed turns")
     ax.set_title(f"Where is the car going?\n"
-                 f"(blue route, turned {' then '.join(turns)} at numbered crossings)\n"
+                 f"(blue route, {route} at numbered crossings)\n"
                  f"green boxes = most likely regions, together holding 50%")
     ax.set_aspect("equal")
     ax.set_xlabel("metres")
@@ -555,8 +950,27 @@ def main():
                     help="download the roads of --places, save them to FILE and "
                          "exit (or continue with that graph if --turn is given)")
     ap.add_argument("--places", nargs="+", default=PORTO_PLACES,
-                    help="place names for --build-graph (default: Porto, "
-                         "Matosinhos, Maia, Vila Nova de Gaia, Gondomar)")
+                    help="place names for --build-graph / --build-landmarks "
+                         "(default: Porto, Matosinhos, Maia)")
+    ap.add_argument("--landmarks", metavar="FILE",
+                    help="use landmarks (.geojson from --build-landmarks) as "
+                         "the destination prior instead of a uniform one")
+    ap.add_argument("--build-landmarks", metavar="FILE",
+                    help="download the landmarks of --places, save them to FILE "
+                         "and exit (or continue with them if --turn is given)")
+    ap.add_argument("--landmark-floor", type=float, default=0.2,
+                    help="share of the prior spread uniformly over all "
+                         "intersections (default 0.2; the rest goes to landmarks)")
+    ap.add_argument("--time", metavar="HH:MM",
+                    help="time the car was seen (or 'now'); with --landmarks, "
+                         "favours places busy at that hour, e.g. universities "
+                         "in the morning (see PROFILES)")
+    ap.add_argument("--day", choices=["weekday"] + DAYS,
+                    help="day the car was seen (default: weekday, or today "
+                         "with --time now)")
+    ap.add_argument("--landmark-sigma", type=float, default=100,
+                    help="how far a landmark's weight spreads to nearby "
+                         "intersections, metres (default 100)")
     ap.add_argument("--beta", type=float, default=0.03,
                     help="driver rationality per second of detour (default 0.03: "
                          "a 60 s detour is ~6x less likely)")
@@ -569,12 +983,25 @@ def main():
 
     if args.build_graph and args.graph:
         ap.error("use either --build-graph or --graph, not both")
+    if args.build_landmarks and args.landmarks:
+        ap.error("use either --build-landmarks or --landmarks, not both")
+    if args.demo and (args.landmarks or args.build_landmarks):
+        ap.error("landmarks need a real map, not --demo")
+    if (args.time or args.day) and not (args.landmarks or args.build_landmarks):
+        ap.error("--time / --day weight the landmarks, so they need --landmarks")
+    try:
+        when = parse_when(args.time, args.day)
+    except ValueError as e:
+        ap.error(str(e))
     G = None
     if args.build_graph:
         G = build_place_graph(args.places, args.build_graph)
-        if not args.turn:
-            return
+    if args.build_landmarks:
+        build_landmarks(args.places, args.build_landmarks)
+        args.landmarks = args.build_landmarks
     if not args.turn:
+        if args.build_graph or args.build_landmarks:
+            return
         ap.error("--turn is required")
 
     if args.demo:
@@ -589,11 +1016,33 @@ def main():
         else:
             G, X = load_osm_graph(args.lat, args.lon, args.radius)
 
-    post, path_nodes = destination_posterior(G, X, args.heading, args.turn,
-                                             args.beta, args.trip_scale)
+    landmarks = None
+    if args.landmarks:
+        landmarks = LandmarkPrior(G, args.landmarks, args.landmark_sigma,
+                                  args.landmark_floor, when)
+
+    post, path_nodes = destination_posterior(
+        G, X, args.heading, args.turn, args.beta, args.trip_scale,
+        landmarks.node_prior() if landmarks else None)
     cells = aggregate_regions(G, post, args.cell)
     rows = write_csv(cells, args.cell, f"{args.out}_regions.csv")
-    plot(G, path_nodes, post, cells, args.cell, args.turn, f"{args.out}_map.png")
+    places = []
+    if landmarks:
+        ranked, elsewhere = landmarks.rank(post)
+        write_places_csv(landmarks, ranked, elsewhere, f"{args.out}_places.csv")
+        places = [(*landmarks.points[i], landmarks.names[i] or landmarks.categories[i])
+                  for i, _ in ranked[:5]]
+    plot(G, path_nodes, post, cells, args.cell, args.turn, f"{args.out}_map.png",
+         places)
+
+    if landmarks:
+        print("\nTop places:")
+        cum = 0.0
+        for rank, (i, p) in enumerate(ranked[:10], 1):
+            cum += p
+            print(f"  {rank:2d}. {p * 100:5.2f}%  (cum {cum * 100:5.1f}%)  "
+                  f"{landmarks.label(i)}")
+        print(f"      {elsewhere * 100:5.2f}%  elsewhere (no landmark)")
 
     print(f"\nTop regions ({args.cell:.0f} m squares):")
     cum = 0.0
@@ -603,7 +1052,8 @@ def main():
                  if c["lat"] else
                  f"x={(cx + .5) * args.cell:.0f} m, y={(cy + .5) * args.cell:.0f} m")
         print(f"  {rank:2d}. {c['p'] * 100:5.2f}%  (cum {cum * 100:5.1f}%)  {where}")
-    print(f"\nWrote {args.out}_map.png and {args.out}_regions.csv")
+    print(f"\nWrote {args.out}_map.png and {args.out}_regions.csv"
+          + (f" and {args.out}_places.csv" if landmarks else ""))
 
 
 if __name__ == "__main__":

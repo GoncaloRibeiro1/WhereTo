@@ -9,9 +9,14 @@ cache/
 #   python turn_destination.py --build-graph porto.graphml)
 *.graphml
 
+# Landmarks built by --build-landmarks (rebuild with
+#   python turn_destination.py --build-landmarks porto_landmarks.geojson)
+*_landmarks.geojson
+
 # Generated outputs
 *_map.png
 *_regions.csv
+*_places.csv
 
 # Local Claude Code settings
 .claude/settings.local.json
