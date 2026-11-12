@@ -48,6 +48,15 @@ Real map (needs internet access to OpenStreetMap):
                 first crossing (0 = north, 90 = east, 180 = south, 270 = west)
   --turn        one or more of: left | right | straight
 
+Cached city graph (download once, then reuse offline):
+    python turn_destination.py --build-graph porto.graphml
+    python turn_destination.py --graph porto.graphml --lat 41.1622 \
+        --lon -8.5989 --heading 0 --turn right right
+
+  --build-graph downloads the roads of --places (default: Porto, Matosinhos,
+  Maia, Vila Nova de Gaia, Gondomar) and saves them; --graph loads that file
+  instead of downloading, and --radius is then ignored.
+
 Offline demo (synthetic city grid, no internet needed):
     python turn_destination.py --demo --turn right left
 
@@ -80,16 +89,77 @@ IDEAL_DELTA = {"straight": 0, "right": 90, "left": -90}
 # ----------------------------------------------------------------------------
 # Loading the road network
 # ----------------------------------------------------------------------------
+# Municipalities loaded by --build-graph by default: Porto plus its neighbours,
+# since many trips cross the municipal border.
+PORTO_PLACES = [
+    "Porto, Portugal",
+    "Matosinhos, Portugal",
+    "Maia, Portugal",
+    "Vila Nova de Gaia, Portugal",
+    "Gondomar, Portugal",
+]
+
+
+def _prepare_osm_graph(G):
+    """Add speeds and travel times, remember each node's lon/lat, and project
+    to metres. (osmnx's project_graph overwrites x/y and does not keep the
+    original coordinates, so they are copied to 'lon'/'lat' first.)"""
+    import osmnx as ox
+    G = ox.add_edge_speeds(G)          # fills missing speed limits by road type
+    G = ox.add_edge_travel_times(G)    # travel_time = length / speed
+    for _, nd in G.nodes(data=True):
+        nd["lon"], nd["lat"] = nd["x"], nd["y"]
+    return ox.project_graph(G)         # UTM metres in x/y
+
+
+def nearest_node(G, lat, lon):
+    """The node closest to (lat, lon). Uses the 'lon'/'lat' node attributes
+    (local flat-earth approximation, fine at city scale)."""
+    nodes = list(G.nodes)
+    la = np.array([G.nodes[n]["lat"] for n in nodes])
+    lo = np.array([G.nodes[n]["lon"] for n in nodes])
+    dx = (lo - lon) * math.cos(math.radians(lat))
+    dy = la - lat
+    i = int(np.argmin(dx * dx + dy * dy))
+    dist_m = math.hypot(dx[i], dy[i]) * 111_320
+    if dist_m > 200:
+        print(f"Warning: nearest intersection is {dist_m:.0f} m from "
+              f"({lat}, {lon}); is the point inside the map?")
+    return nodes[i]
+
+
 def load_osm_graph(lat, lon, radius_m):
     """Download drivable roads around (lat, lon). Returns the graph projected
     to metres (x, y), with 'travel_time' (seconds) on every edge."""
     import osmnx as ox
     G = ox.graph_from_point((lat, lon), dist=radius_m, network_type="drive")
-    G = ox.add_edge_speeds(G)          # fills missing speed limits by road type
-    G = ox.add_edge_travel_times(G)    # travel_time = length / speed
-    center = ox.distance.nearest_nodes(G, lon, lat)
-    G = ox.project_graph(G)            # metres, keeps 'lon'/'lat' on nodes
-    return G, center
+    G = _prepare_osm_graph(G)
+    return G, nearest_node(G, lat, lon)
+
+
+def build_place_graph(places, path):
+    """Download drivable roads for the named places (one merged graph),
+    prepare it like load_osm_graph and save it as GraphML for --graph."""
+    import osmnx as ox
+    print(f"Downloading drivable roads for: {'; '.join(places)} ...")
+    G = ox.graph_from_place(places, network_type="drive")
+    G = _prepare_osm_graph(G)
+    ox.save_graphml(G, path)
+    print(f"Saved {G.number_of_nodes()} nodes, {G.number_of_edges()} edges "
+          f"to {path}")
+    return G
+
+
+def load_graph_file(path):
+    """Load a graph saved by build_place_graph (already projected, with
+    travel_time on edges and lon/lat on nodes)."""
+    import osmnx as ox
+    G = ox.load_graphml(path, node_dtypes={"lon": float, "lat": float})
+    missing = [a for a in ("lon", "lat") if a not in next(iter(G.nodes.values()))]
+    if missing or not all("travel_time" in d for _, _, d in G.edges(data=True)):
+        raise ValueError(f"{path} was not made by --build-graph "
+                         f"(needs lon/lat on nodes and travel_time on edges)")
+    return G
 
 
 def make_demo_graph(n=20, spacing=150.0):
@@ -341,10 +411,12 @@ def plot(G, path_nodes, post, cells, cell_m, turns, path):
     cb = fig.colorbar(im, ax=ax, shrink=0.75)
     cb.set_label(f"P(destination in region | turned {', '.join(turns)})")
 
-    # Roads
-    for u, v, data in G.edges(data=True):
-        pts = np.array(_edge_coords(G, u, v, data))
-        ax.plot(pts[:, 0], pts[:, 1], color="0.55", lw=0.5, zorder=2)
+    # Roads (one LineCollection: much faster than one plot() per edge on a
+    # city-sized graph)
+    from matplotlib.collections import LineCollection
+    segs = [_edge_coords(G, u, v, data) for u, v, data in G.edges(data=True)]
+    ax.add_collection(LineCollection(segs, colors="0.55", linewidths=0.5,
+                                     zorder=2))
 
     # The car's observed route: arrows from node to node, dots at crossings
     for a, b in zip(path_nodes, path_nodes[1:]):
@@ -390,9 +462,18 @@ def main():
                     help="compass direction of travel when arriving at the "
                          "first crossing (0=N, 90=E)")
     ap.add_argument("--turn", nargs="+", choices=["left", "right", "straight"],
-                    required=True,
                     help="turns at successive crossings, e.g. --turn right left")
-    ap.add_argument("--radius", type=float, default=3000, help="map radius, metres")
+    ap.add_argument("--radius", type=float, default=3000,
+                    help="map radius, metres (ignored with --graph)")
+    ap.add_argument("--graph", metavar="FILE",
+                    help="use a saved road network (.graphml from --build-graph) "
+                         "instead of downloading one")
+    ap.add_argument("--build-graph", metavar="FILE",
+                    help="download the roads of --places, save them to FILE and "
+                         "exit (or continue with that graph if --turn is given)")
+    ap.add_argument("--places", nargs="+", default=PORTO_PLACES,
+                    help="place names for --build-graph (default: Porto, "
+                         "Matosinhos, Maia, Vila Nova de Gaia, Gondomar)")
     ap.add_argument("--beta", type=float, default=0.03,
                     help="driver rationality per second of detour (default 0.03: "
                          "a 60 s detour is ~6x less likely)")
@@ -403,12 +484,27 @@ def main():
     ap.add_argument("--out", default="destination")
     args = ap.parse_args()
 
+    if args.build_graph and args.graph:
+        ap.error("use either --build-graph or --graph, not both")
+    G = None
+    if args.build_graph:
+        G = build_place_graph(args.places, args.build_graph)
+        if not args.turn:
+            return
+    if not args.turn:
+        ap.error("--turn is required")
+
     if args.demo:
         G, X = make_demo_graph()
     else:
         if args.lat is None or args.lon is None:
             ap.error("--lat and --lon are required unless --demo is used")
-        G, X = load_osm_graph(args.lat, args.lon, args.radius)
+        if args.graph:
+            G = load_graph_file(args.graph)
+        if G is not None:
+            X = nearest_node(G, args.lat, args.lon)
+        else:
+            G, X = load_osm_graph(args.lat, args.lon, args.radius)
 
     post, path_nodes = destination_posterior(G, X, args.heading, args.turn,
                                              args.beta, args.trip_scale)
