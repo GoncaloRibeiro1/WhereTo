@@ -1,0 +1,18 @@
+# Python
+.venv/
+__pycache__/
+
+# osmnx download cache (re-created automatically)
+cache/
+
+# Road network built by --build-graph (large; rebuild with
+#   python turn_destination.py --build-graph porto.graphml)
+*.graphml
+
+# Generated outputs
+*_map.png
+*_regions.csv
+
+# Local Claude Code settings
+.claude/settings.local.json
+CLAUDE.md
