@@ -91,7 +91,9 @@ import argparse
 import ast
 import csv
 import math
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
+from typing import NamedTuple
 
 import matplotlib
 matplotlib.use("Agg")
@@ -487,15 +489,22 @@ class LandmarkPrior:
         self.pair_mass = lm_share / total * w_now[li] / w_now.sum() * self.pair_share
         self.prior = np.full(len(self.nodes), self.floor_share / len(self.nodes))
         np.add.at(self.prior, ni, self.pair_mass)
-        print(f"Landmark prior: {int((self.weights > 0).sum())} landmarks, "
-              f"{1 - self.floor_share:.0%} of P(d) on landmarks, "
-              f"{self.floor_share:.0%} uniform")
+        self.when, self.factor = when, factor
+
+    def describe(self):
+        """A few lines summarising the prior, for printing."""
+        lines = [f"Landmark prior: {int((self.weights > 0).sum())} landmarks, "
+                 f"{1 - self.floor_share:.0%} of P(d) on landmarks, "
+                 f"{self.floor_share:.0%} uniform"]
+        day, hour = self.when
         if day is not None or hour is not None:
             when_s = day or "weekday"
             if hour is not None:
                 when_s += " %02d:%02d" % divmod(round(hour * 60), 60)
-            busy = sorted(factor.items(), key=lambda kv: -kv[1])
-            print(f"  {when_s}: " + ", ".join(f"{p} x{f:.2f}" for p, f in busy))
+            busy = sorted(self.factor.items(), key=lambda kv: -kv[1])
+            lines.append(f"  {when_s}: " +
+                         ", ".join(f"{p} x{f:.2f}" for p, f in busy))
+        return lines
 
     @staticmethod
     def _weight(category, area):
@@ -503,10 +512,6 @@ class LandmarkPrior:
         if typical and area and area > 0:
             w *= float(np.clip(math.sqrt(area / typical), *SIZE_FACTOR))
         return w
-
-    def node_prior(self):
-        """{node: P(d = node)}, summing to 1."""
-        return dict(zip(self.nodes, self.prior))
 
     def label(self, i):
         name = self.names[i] or "unnamed"
@@ -568,21 +573,52 @@ def departure_bearing(G, u, v, data):
 # ----------------------------------------------------------------------------
 # The model
 # ----------------------------------------------------------------------------
+class Exit(NamedTuple):
+    """One road leaving a junction."""
+    v: object            # the node it leads to
+    key: int             # which edge, when several roads join the same two nodes
+    travel_time: float   # seconds along this road
+    delta: float         # heading change, degrees (+ = to the right)
+    data: dict           # the OSM edge attributes (name, geometry, ...)
+
+
+@dataclass
+class Crossing:
+    """A junction on the route: what the driver could do there, and what
+    they did."""
+    node: object         # the junction
+    came_from: object    # node the car arrived from
+    in_bearing: float    # heading on arrival
+    kind: str            # 'crossroads', 'fork' or 'angles' (see exits_by_turn)
+    exits: dict          # class -> [Exit, ...]
+    taken: Exit          # the road the car left on
+    turn: str            # class of `taken`: 'left' / 'straight' / 'right'
+
+
+# A route is a list of consecutive edges (u, v, key): the road the car
+# arrived on, then the road it took at each junction. The junctions are the
+# nodes where one edge ends and the next begins.
+def route_nodes(route):
+    """[first node, every junction, last node] of a route."""
+    return [route[0][0]] + [v for _, v, _ in route]
+
+
 def find_approach(G, X, heading):
-    """Pick the incoming road whose arrival heading best matches `heading`."""
+    """Pick the incoming road whose arrival heading best matches `heading`.
+    Returns (node it comes from, edge key, arrival bearing)."""
     best = None
     for u, _, k, data in G.in_edges(X, keys=True, data=True):
         b = arrival_bearing(G, u, X, data)
         err = abs(_angle_diff(heading, b))
         if best is None or err < best[0]:
-            best = (err, u, b)
+            best = (err, u, k, b)
     if best is None:
         raise ValueError("No road enters this intersection.")
-    err, u, b = best
+    err, u, k, b = best
     if err > 45:
         print(f"Warning: closest incoming road has heading {b:.0f}°, "
               f"{err:.0f}° away from the {heading:.0f}° you gave.")
-    return u, b
+    return u, k, b
 
 
 def road_name(data):
@@ -643,7 +679,7 @@ def fork_classes(exits):
     """
     if set(exits) != {"straight"} or len(exits["straight"]) != 2:
         return None
-    left, right = sorted(exits["straight"], key=lambda e: e[2])
+    left, right = sorted(exits["straight"], key=lambda e: e.delta)
     return defaultdict(list, left=[left], right=[right])
 
 
@@ -651,7 +687,7 @@ def exits_by_turn(G, X, came_from, in_bearing):
     """Group the roads leaving X into 'left' / 'right' / 'straight'.
     Returns (exits, kind), kind = 'crossroads', 'fork' or 'angles'."""
     by_position = crossroads_classes(G, X, came_from, in_bearing)
-    exits = defaultdict(list)       # class -> list of (v, travel_time, delta, data)
+    exits = defaultdict(list)       # class -> [Exit, ...]
     for _, v, k, data in G.out_edges(X, keys=True, data=True):
         if v == came_from:
             continue                # going back where it came from = U-turn
@@ -664,7 +700,7 @@ def exits_by_turn(G, X, came_from, in_bearing):
             cls = "straight"
         else:
             cls = "right" if delta > 0 else "left"
-        exits[cls].append((v, data["travel_time"], delta, data))
+        exits[cls].append(Exit(v, k, data["travel_time"], delta, data))
     if by_position is not None:
         return exits, "crossroads"
     fork = fork_classes(exits)
@@ -673,117 +709,198 @@ def exits_by_turn(G, X, came_from, in_bearing):
     return exits, "angles"
 
 
-def turn_likelihood(G, exits, observed_turn, beta, nodes):
+def crossings_along(G, route):
     """
-    P(observed_turn | d) at one crossing, for every d in `nodes`.
-
-    For every exit road e = X->v, T_e(d) = time(X->v) + fastest time v->d.
-    P(exit e | d) = softmax(-beta * T_e(d)) over all exits.
-    P(turn class | d) = sum of P(exit | d) over exits in that class.
-    Also returns the fastest time from this crossing to each d.
+    For each junction the route passes through: the roads the driver could
+    take there (exits_by_turn) and the one they took. Raises ValueError if
+    the edges don't join up or the route makes a move that isn't allowed
+    (U-turn, wrong way up a one-way street).
     """
-    # One Dijkstra per exit road gives the time to every destination at once.
-    options = []                                      # (class, {d: T_e(d)})
-    for cls, lst in exits.items():
-        for v, t_edge, _, _ in lst:
-            dist = nx.single_source_dijkstra_path_length(G, v, weight="travel_time")
-            options.append((cls, {d: t_edge + t for d, t in dist.items()}))
-
-    T = np.full((len(options), len(nodes)), np.inf)
-    for i, (_, dist) in enumerate(options):
-        for j, d in enumerate(nodes):
-            if d in dist:
-                T[i, j] = dist[d]
-
-    best = T.min(axis=0)
-    reachable = np.isfinite(best)
-    # Softmax over exits (shifted by the best time for numerical stability)
-    w = np.zeros_like(T)
-    w[:, reachable] = np.exp(-beta * (T[:, reachable] - best[reachable]))
-    total = w.sum(axis=0)
-    p_exit = np.divide(w, total, out=np.zeros_like(w), where=total > 0)
-    obs = np.array([cls == observed_turn for cls, _ in options])
-    return p_exit[obs].sum(axis=0), best
+    crossings = []
+    for (u, X, k), (X2, v, k2) in zip(route, route[1:]):
+        if X2 != X:
+            raise ValueError(f"Route is not connected: {u}->{X} is followed "
+                             f"by {X2}->{v}")
+        in_bearing = arrival_bearing(G, u, X, G.edges[u, X, k])
+        exits, kind = exits_by_turn(G, X, u, in_bearing)
+        taken = next(((cls, e) for cls, lst in exits.items() for e in lst
+                      if (e.v, e.key) == (v, k2)), None)
+        if taken is None:
+            raise ValueError(f"At junction {X}, {X}->{v} is not an allowed "
+                             f"exit when arriving from {u}")
+        crossings.append(Crossing(X, u, in_bearing, kind, exits,
+                                  taken[1], taken[0]))
+    return crossings
 
 
 def pick_exit(exits, turn):
     """The road the car took for `turn`. If several roads fall in that class,
     take the one closest to an ideal straight / 90° turn."""
     lst = exits[turn]
-    choice = min(lst, key=lambda e: abs(e[2] - IDEAL_DELTA[turn]))
+    choice = min(lst, key=lambda e: abs(e.delta - IDEAL_DELTA[turn]))
     if len(lst) > 1:
         print(f"    note: {len(lst)} roads count as '{turn}' here; following "
-              f"{road_name(choice[3])} ({choice[2]:+.0f}°, closest to "
+              f"{road_name(choice.data)} ({choice.delta:+.0f}°, closest to "
               f"{IDEAL_DELTA[turn]:+d}°)")
     return choice
 
 
-def destination_posterior(G, X, heading, turns, beta, trip_scale=None,
-                          base_prior=None):
+def route_from_turns(G, X, heading, turns):
     """
-    Follow the car through the observed `turns`, starting at crossing X.
-    `base_prior` is {node: P(d)} (e.g. LandmarkPrior.node_prior()); None means
-    every intersection is equally likely.
-
-    Returns ({node: P(dest = node | turns)}, path), where path is the list
-    of nodes the car passed through, starting with the road it arrived on.
+    The command-line way to describe a route: start at junction X, arriving
+    with compass `heading`, then one turn word per junction. Prints each
+    junction's exits so the classification can be checked. Returns the
+    route as a list of edges (see route_nodes).
     """
-    came_from, in_bearing = find_approach(G, X, heading)
-    path = [came_from, X]
-    steps = []                                  # (crossing, exits, turn)
-
+    came_from, key, in_bearing = find_approach(G, X, heading)
+    route = [(came_from, X, key)]
     for k, turn in enumerate(turns, 1):
         exits, kind = exits_by_turn(G, X, came_from, in_bearing)
-        in_data = next(iter(G.get_edge_data(came_from, X).values()))
         print(f"Crossing {k} {X} ({kind}): arriving at heading "
-              f"{in_bearing:.0f}° on {road_name(in_data)}")
+              f"{in_bearing:.0f}° on {road_name(G.edges[came_from, X, key])}")
         for cls in ("left", "straight", "right"):
-            for _, _, delta, data in sorted(exits.get(cls, []), key=lambda e: e[2]):
-                print(f"    {cls:<8} {road_name(data)} ({delta:+.0f}°)")
+            for e in sorted(exits.get(cls, []), key=lambda e: e.delta):
+                print(f"    {cls:<8} {road_name(e.data)} ({e.delta:+.0f}°)")
         print(f"  -> turned {turn}")
         if turn not in exits:
             hint = (" (this is a fork: use 'left' / 'right' for keep left / "
                     "keep right)" if kind == "fork" else "")
             raise ValueError(f"No '{turn}' exit at crossing {k} {X}; "
                              f"available: {sorted(exits)}{hint}")
-        steps.append((X, exits, turn))
+        # Drive to the next junction along the road that was taken
+        e = pick_exit(exits, turn)
+        route.append((X, e.v, e.key))
+        came_from, key, in_bearing = X, e.key, arrival_bearing(G, X, e.v, e.data)
+        X = e.v
+    return route
 
-        # Drive to the next crossing along the road that was taken
-        if k < len(turns):
-            v, _, _, data = pick_exit(exits, turn)
-            came_from, in_bearing = X, arrival_bearing(G, X, v, data)
-            X = v
-            path.append(X)
+
+@dataclass
+class Result:
+    """What predict() returns."""
+    route: list          # the edges (u, v, key) the car drove along
+    crossings: list      # a Crossing for every junction it passed
+    post: dict           # {node: P(destination = node | route)}, non-zero only
+    cells: dict          # post grouped into squares (see aggregate_regions)
+    places: list = None  # [(landmark index, p), ...] best first (with landmarks)
+    elsewhere: float = None  # P(destination is not near any landmark)
+
+    @property
+    def nodes(self):
+        return route_nodes(self.route)
+
+    @property
+    def turns(self):
+        return [c.turn for c in self.crossings]
+
+
+class Predictor:
+    """
+    The model for one road network, ready to answer many questions.
+
+    It keeps the graph and remembers the shortest-path searches it has run
+    (the slow part), so asking again about a route that grew by one junction,
+    or with a different beta / prior, only searches from the new roads.
+    """
+
+    def __init__(self, G, cache_size=512):
+        self.G = G
+        self.nodes = list(G.nodes)
+        self.index = {n: i for i, n in enumerate(self.nodes)}
+        self._times = OrderedDict()            # node -> array, least recent first
+        self.cache_size = cache_size
+
+    def times_from(self, v):
+        """Fastest travel time (s) from v to every node, in self.nodes order
+        (inf where unreachable)."""
+        t = self._times.get(v)
+        if t is not None:
+            self._times.move_to_end(v)
+            return t
+        dist = nx.single_source_dijkstra_path_length(self.G, v, weight="travel_time")
+        t = np.full(len(self.nodes), np.inf)
+        t[[self.index[n] for n in dist]] = list(dist.values())
+        self._times[v] = t
+        if len(self._times) > self.cache_size:
+            self._times.popitem(last=False)
+        return t
+
+    def likelihood(self, c, beta, observed="exit"):
+        """
+        P(what was seen at crossing c | dest = d) for every node d.
+
+        For every exit road e = X->v, T_e(d) = time(X->v) + fastest time v->d,
+        and P(exit e | d) = softmax(-beta * T_e(d)) over all exits.
+        observed='exit': the exact road taken was seen (clicking on a map);
+        observed='turn': only its class, so P(turn | d) = sum of P(exit | d)
+        over the exits in that class (the --turn words).
+        Also returns the fastest time from X to each d.
+        """
+        options = [(cls, e) for cls, lst in c.exits.items() for e in lst]
+        T = np.vstack([e.travel_time + self.times_from(e.v) for _, e in options])
+        best = T.min(axis=0)
+        reachable = np.isfinite(best)
+        # Softmax over exits (shifted by the best time for numerical stability)
+        w = np.zeros_like(T)
+        w[:, reachable] = np.exp(-beta * (T[:, reachable] - best[reachable]))
+        total = w.sum(axis=0)
+        p_exit = np.divide(w, total, out=np.zeros_like(w), where=total > 0)
+        if observed == "exit":
+            obs = [(e.v, e.key) == (c.taken.v, c.taken.key) for _, e in options]
+        elif observed == "turn":
+            obs = [cls == c.turn for cls, _ in options]
         else:
-            path.append(pick_exit(exits, turn)[0])   # for the map arrow only
+            raise ValueError(f"observed must be 'exit' or 'turn', not {observed!r}")
+        return p_exit[np.array(obs)].sum(axis=0), best
 
-    # A car that drove through a crossing wasn't going to that crossing.
-    passed = {X0 for X0, _, _ in steps}
-    nodes = [d for d in G.nodes if d not in passed]
+    def predict(self, route, *, beta=0.03, trip_scale=None, landmarks=None,
+                observed="exit", cell_m=300):
+        """
+        P(destination | route) for every node.
 
-    likelihood = np.ones(len(nodes))
-    first_best = None
-    for X0, exits, turn in steps:
-        lk, best = turn_likelihood(G, exits, turn, beta, nodes)
-        likelihood *= lk
-        if first_best is None:
-            first_best = best
+        route       edges (u, v, key): the road the car arrived on, then the
+                    road it took at each junction (at least two edges)
+        beta        driver rationality per second of detour
+        trip_scale  favour trips of about this many seconds (None = off)
+        landmarks   a LandmarkPrior for P(d); None = uniform
+        observed    'exit' or 'turn', see likelihood()
+        cell_m      size of the squares in Result.cells
+        """
+        crossings = crossings_along(self.G, route)
+        if not crossings:
+            raise ValueError("The route must pass through at least one junction.")
 
-    # Prior P(d): uniform or from landmarks, optionally times a preference for
-    # trips of about `trip_scale` seconds (measured from the first crossing).
-    reachable = np.isfinite(first_best)
-    prior = np.where(reachable, 1.0, 0.0)
-    if base_prior is not None:
-        prior *= np.array([base_prior[d] for d in nodes])
-    if trip_scale:
-        prior[reachable] *= np.exp(-first_best[reachable] / trip_scale)
+        likelihood = np.ones(len(self.nodes))
+        first_best = None
+        for c in crossings:
+            lk, best = self.likelihood(c, beta, observed)
+            likelihood *= lk
+            if first_best is None:
+                first_best = best
 
-    post = likelihood * prior
-    if post.sum() == 0:
-        raise ValueError("No destination is consistent with these turns.")
-    post /= post.sum()
-    keep = post > 0
-    return dict(zip([d for d, k in zip(nodes, keep) if k], post[keep])), path
+        # Prior P(d): uniform or from landmarks, optionally times a preference
+        # for trips of about `trip_scale` seconds (from the first junction).
+        reachable = np.isfinite(first_best)
+        prior = np.where(reachable, 1.0, 0.0)
+        if landmarks is not None:
+            if landmarks.nodes != self.nodes:
+                raise ValueError("landmarks were built for a different graph")
+            prior *= landmarks.prior
+        if trip_scale:
+            prior[reachable] *= np.exp(-first_best[reachable] / trip_scale)
+        # A car that drove through a junction wasn't going to that junction.
+        prior[[self.index[c.node] for c in crossings]] = 0
+
+        post = likelihood * prior
+        if post.sum() == 0:
+            raise ValueError("No destination is consistent with these turns.")
+        post /= post.sum()
+        post = {self.nodes[i]: post[i] for i in np.flatnonzero(post)}
+
+        res = Result(route, crossings, post, aggregate_regions(self.G, post, cell_m))
+        if landmarks is not None:
+            res.places, res.elsewhere = landmarks.rank(post)
+        return res
 
 
 def aggregate_regions(G, post, cell_m):
@@ -1020,29 +1137,31 @@ def main():
     if args.landmarks:
         landmarks = LandmarkPrior(G, args.landmarks, args.landmark_sigma,
                                   args.landmark_floor, when)
+        print("\n".join(landmarks.describe()))
 
-    post, path_nodes = destination_posterior(
-        G, X, args.heading, args.turn, args.beta, args.trip_scale,
-        landmarks.node_prior() if landmarks else None)
-    cells = aggregate_regions(G, post, args.cell)
-    rows = write_csv(cells, args.cell, f"{args.out}_regions.csv")
+    route = route_from_turns(G, X, args.heading, args.turn)
+    res = Predictor(G).predict(route, beta=args.beta, trip_scale=args.trip_scale,
+                               landmarks=landmarks, observed="turn",
+                               cell_m=args.cell)
+
+    rows = write_csv(res.cells, args.cell, f"{args.out}_regions.csv")
     places = []
     if landmarks:
-        ranked, elsewhere = landmarks.rank(post)
-        write_places_csv(landmarks, ranked, elsewhere, f"{args.out}_places.csv")
+        write_places_csv(landmarks, res.places, res.elsewhere,
+                         f"{args.out}_places.csv")
         places = [(*landmarks.points[i], landmarks.names[i] or landmarks.categories[i])
-                  for i, _ in ranked[:5]]
-    plot(G, path_nodes, post, cells, args.cell, args.turn, f"{args.out}_map.png",
-         places)
+                  for i, _ in res.places[:5]]
+    plot(G, res.nodes, res.post, res.cells, args.cell, res.turns,
+         f"{args.out}_map.png", places)
 
     if landmarks:
         print("\nTop places:")
         cum = 0.0
-        for rank, (i, p) in enumerate(ranked[:10], 1):
+        for rank, (i, p) in enumerate(res.places[:10], 1):
             cum += p
             print(f"  {rank:2d}. {p * 100:5.2f}%  (cum {cum * 100:5.1f}%)  "
                   f"{landmarks.label(i)}")
-        print(f"      {elsewhere * 100:5.2f}%  elsewhere (no landmark)")
+        print(f"      {res.elsewhere * 100:5.2f}%  elsewhere (no landmark)")
 
     print(f"\nTop regions ({args.cell:.0f} m squares):")
     cum = 0.0
