@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Turn Destination</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Cpath d='M20 4 L33 34 L20 26 L7 34 Z' fill='%232a78d6'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="map" aria-label="Map of Porto"></div>
+
+  <aside id="panel">
+    <header>
+      <h1>Turn Destination</h1>
+      <p class="sub">Where is the car going?</p>
+    </header>
+
+    <section id="status" aria-live="polite">
+      <p id="instruction">Loading the map…</p>
+      <div class="buttons">
+        <button id="flip" hidden title="Point the arrow the other way along this street">⇄ Flip direction</button>
+        <button id="undo" disabled title="Undo the last move (Backspace)">↶ Undo</button>
+        <button id="reset" disabled title="Start again">Reset</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>When</h2>
+      <div class="row">
+        <label>Time <input type="time" id="time" step="300"></label>
+        <button id="now" class="small" title="Use the current time and day">Now</button>
+        <button id="anytime" class="small" title="Ignore time of day">Any time</button>
+      </div>
+      <div class="row">
+        <label>Day <select id="day"><option value="">Any weekday</option></select></label>
+      </div>
+      <div class="row">
+        <label class="check"><input type="checkbox" id="landmarks" checked> Favour busy places (hospitals, universities, malls…)</label>
+      </div>
+      <details>
+        <summary>Model settings</summary>
+        <div class="row"><label>Driver rationality β <input type="number" id="beta" min="0.001" max="1" step="0.005" value="0.03"></label></div>
+        <p class="hint">0.03: a route 60 s slower is about 6× less likely.</p>
+        <div class="row"><label>Typical trip <input type="number" id="trip" min="1" max="120" step="1" placeholder="off"> min</label></div>
+        <p class="hint">Favour trips of about this length (empty = no preference).</p>
+        <div class="row"><label>Square size <select id="cell">
+          <option value="200">200 m</option>
+          <option value="300" selected>300 m</option>
+          <option value="500">500 m</option>
+        </select></label></div>
+      </details>
+    </section>
+
+    <section id="route-section" hidden>
+      <h2>Route</h2>
+      <ol id="route"></ol>
+    </section>
+
+    <section id="places-section" hidden>
+      <h2>Most likely places</h2>
+      <ol id="places"></ol>
+      <p id="elsewhere" class="hint"></p>
+    </section>
+
+    <section id="legend-section" hidden>
+      <h2>Heatmap</h2>
+      <div id="legend-bar"></div>
+      <div id="legend-ticks"><span>0%</span><span id="legend-mid"></span><span id="legend-max"></span></div>
+      <p class="hint" id="legend-note"></p>
+    </section>
+  </aside>
+
+  <div id="toast" role="alert" hidden></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
