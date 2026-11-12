@@ -66,6 +66,7 @@ Requires: pip install osmnx networkx matplotlib numpy
 """
 
 import argparse
+import ast
 import csv
 import math
 from collections import defaultdict
@@ -80,6 +81,8 @@ import numpy as np
 STRAIGHT_MAX = 30     # |change| < 30°           -> straight
 TURN_MAX = 150        # 30° <= |change| <= 150°  -> left / right
                       # beyond 150°              -> U-turn (not allowed)
+STRAIGHT_LOOSE = 60   # at a 4-way crossroads the middle road is 'straight'
+                      # if within 60° (see crossroads_classes)
 
 # Ideal heading change for each class, used to pick one road when a class
 # has several (e.g. two roads that both count as "right").
@@ -238,21 +241,72 @@ def find_approach(G, X, heading):
     return u, b
 
 
+def road_name(data):
+    """Street name of an edge ('unnamed road' if OSM has none). Merged edges
+    can carry several names, stored as a list or, after GraphML, as its repr."""
+    name = data.get("name")
+    if isinstance(name, str) and name.startswith("["):
+        try:
+            name = ast.literal_eval(name)
+        except (ValueError, SyntaxError):
+            pass
+    if isinstance(name, (list, tuple)):
+        name = " / ".join(map(str, name))
+    return name or "unnamed road"
+
+
+def _arms(G, X):
+    """Every road touching X, including one-way roads that only lead in:
+    {neighbour: bearing pointing away from X}."""
+    arms = {}
+    for _, v, data in G.out_edges(X, data=True):
+        if v != X:
+            arms.setdefault(v, departure_bearing(G, X, v, data))
+    for u, _, data in G.in_edges(X, data=True):
+        if u != X:
+            arms.setdefault(u, (arrival_bearing(G, u, X, data) + 180) % 360)
+    return arms
+
+
+def crossroads_classes(G, X, came_from, in_bearing):
+    """
+    At a four-way crossroads, people name turns by position, not by angle:
+    of the three other roads, the leftmost is 'left', the middle one is
+    'straight' (across the junction), the rightmost is 'right', even when the
+    crossing is skewed (e.g. the middle road is 47° off). Returns
+    {neighbour: class}, or None if X is not a clear crossroads, in which case
+    the angle thresholds are used instead.
+    """
+    arms = _arms(G, X)
+    others = sorted((_angle_diff(in_bearing, b), v)
+                    for v, b in arms.items() if v != came_from)
+    if len(arms) != 4 or len(others) != 3:
+        return None
+    (dl, vl), (dm, vm), (dr, vr) = others
+    if not (dl < 0 < dr and abs(dm) <= STRAIGHT_LOOSE):
+        return None
+    return {vl: "left", vm: "straight", vr: "right"}
+
+
 def exits_by_turn(G, X, came_from, in_bearing):
-    """Group the roads leaving X into 'left' / 'right' / 'straight'."""
+    """Group the roads leaving X into 'left' / 'right' / 'straight'.
+    Returns (exits, kind), kind = 'crossroads' or 'angles'."""
+    by_position = crossroads_classes(G, X, came_from, in_bearing)
     exits = defaultdict(list)       # class -> list of (v, travel_time, delta, data)
     for _, v, k, data in G.out_edges(X, keys=True, data=True):
         if v == came_from:
             continue                # going back where it came from = U-turn
         delta = _angle_diff(in_bearing, departure_bearing(G, X, v, data))
-        if abs(delta) < STRAIGHT_MAX:
-            cls = "straight"
-        elif abs(delta) <= TURN_MAX:
-            cls = "right" if delta > 0 else "left"
-        else:
+        if abs(delta) > TURN_MAX:
             continue                # sharp U-turn, not allowed
+        if by_position is not None:
+            cls = by_position[v]
+        elif abs(delta) < STRAIGHT_MAX:
+            cls = "straight"
+        else:
+            cls = "right" if delta > 0 else "left"
         exits[cls].append((v, data["travel_time"], delta, data))
-    return exits
+    return exits, ("crossroads" if by_position else "angles")
 
 
 def turn_likelihood(G, exits, observed_turn, beta, nodes):
@@ -292,10 +346,12 @@ def pick_exit(exits, turn):
     """The road the car took for `turn`. If several roads fall in that class,
     take the one closest to an ideal straight / 90° turn."""
     lst = exits[turn]
+    choice = min(lst, key=lambda e: abs(e[2] - IDEAL_DELTA[turn]))
     if len(lst) > 1:
-        print(f"    note: {len(lst)} roads count as '{turn}' here; "
-              f"using the one closest to {IDEAL_DELTA[turn]:+d}°")
-    return min(lst, key=lambda e: abs(e[2] - IDEAL_DELTA[turn]))
+        print(f"    note: {len(lst)} roads count as '{turn}' here; following "
+              f"{road_name(choice[3])} ({choice[2]:+.0f}°, closest to "
+              f"{IDEAL_DELTA[turn]:+d}°)")
+    return choice
 
 
 def destination_posterior(G, X, heading, turns, beta, trip_scale=None):
@@ -310,10 +366,14 @@ def destination_posterior(G, X, heading, turns, beta, trip_scale=None):
     steps = []                                  # (crossing, exits, turn)
 
     for k, turn in enumerate(turns, 1):
-        exits = exits_by_turn(G, X, came_from, in_bearing)
-        print(f"Crossing {k} {X}: arriving at heading {in_bearing:.0f}°, exits: "
-              + ", ".join(f"{c} ({len(v)})" for c, v in exits.items())
-              + f"  ->  turned {turn}")
+        exits, kind = exits_by_turn(G, X, came_from, in_bearing)
+        in_data = next(iter(G.get_edge_data(came_from, X).values()))
+        print(f"Crossing {k} {X} ({kind}): arriving at heading "
+              f"{in_bearing:.0f}° on {road_name(in_data)}")
+        for cls in ("left", "straight", "right"):
+            for _, _, delta, data in sorted(exits.get(cls, []), key=lambda e: e[2]):
+                print(f"    {cls:<8} {road_name(data)} ({delta:+.0f}°)")
+        print(f"  -> turned {turn}")
         if turn not in exits:
             raise ValueError(f"No '{turn}' exit at crossing {k} {X}; "
                              f"available: {sorted(exits)}")
