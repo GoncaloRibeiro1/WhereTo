@@ -41,10 +41,10 @@
       </div>
       <details>
         <summary>Model settings</summary>
-        <div class="row"><label>Driver rationality β <input type="number" id="beta" min="0.001" max="1" step="0.005" value="0.03"></label></div>
-        <p class="hint">0.03: a route 60 s slower is about 6× less likely.</p>
-        <div class="row"><label>Typical trip <input type="number" id="trip" min="1" max="120" step="1" placeholder="off"> min</label></div>
-        <p class="hint">Favour trips of about this length (empty = no preference).</p>
+        <div class="row"><label>Driver rationality β <input type="number" id="beta" min="0.001" max="1" step="0.005" value="0.06"></label></div>
+        <p class="hint">0.06: a route 60 s slower is about 36× less likely. Lower = turns count less.</p>
+        <div class="row"><label>Typical trip <input type="number" id="trip" min="1" max="120" step="1" value="10" placeholder="off"> min</label></div>
+        <p class="hint">Favour places within about this much driving (free-flow, ~1.5× in real traffic). Empty = distance doesn't matter.</p>
         <div class="row"><label>Square size <select id="cell">
           <option value="200">200 m</option>
           <option value="300" selected>300 m</option>

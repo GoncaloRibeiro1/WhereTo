@@ -56,10 +56,11 @@ class RouteRequest(BaseModel):
 
 
 class Settings(BaseModel):
-    beta: float = Field(0.03, gt=0, description="driver rationality per second "
-                        "of detour (0.03: a 60 s detour is ~6x less likely)")
-    trip_scale: float | None = Field(None, gt=0, description="favour trips of "
-                                     "about this many seconds (null = off)")
+    beta: float = Field(td.BETA, gt=0, description="driver rationality per second "
+                        "of detour (0.06: a 60 s detour is ~36x less likely)")
+    trip_scale: float | None = Field(td.TRIP_SCALE, ge=0, description="favour "
+                                     "destinations within about this many seconds "
+                                     "of free-flow driving (0 or null = off)")
     landmarks: bool = Field(True, description="landmark prior (if the server "
                             "has one) instead of a uniform one")
     time: str | None = Field(None, description="'HH:MM' or 'now'; weights "

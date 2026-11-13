@@ -17,7 +17,8 @@ Model (Bayes' rule):
                           With --landmarks: most of it on intersections near
                           hospitals, universities, malls, stations, ... (see
                           LANDMARKS for the weights), plus a uniform floor.
-                          Optionally favour shorter trips (--trip-scale).
+                          Times a preference for nearby destinations
+                          (--trip-scale, default TRIP_SCALE = 600 s).
   likelihood  P(turn | d) if the driver were going to d, how likely is this
                           turn at this crossing? A "noisy rational driver":
                           for each exit road compute the fastest time to d if
@@ -111,6 +112,21 @@ STRAIGHT_LOOSE = 60   # at a 4-way crossroads the middle road is 'straight'
 # Ideal heading change for each class, used to pick one road when a class
 # has several (e.g. two roads that both count as "right").
 IDEAL_DELTA = {"straight": 0, "right": 90, "left": -90}
+
+# How strongly a turn counts against destinations it leads away from:
+# P(exit | d) ∝ exp(-BETA * T_exit(d)). 0.06 per second: a route 60 s slower
+# is ~36x less likely. With 0.03 (6x) a car could drive several minutes away
+# from a big attractor (NorteShopping) and it stayed the top place, because
+# each junction only charges part of the detour. Much higher would punish the
+# free-flow travel times' own errors (traffic lights, congestion: easily 30 s).
+BETA = 0.06
+
+# Most car trips are short, so the prior favours nearby destinations:
+# P(d) is multiplied by exp(-T / TRIP_SCALE), T = fastest (free-flow) driving
+# time from the first junction to d. 600 s of free-flow driving (~15 min in
+# real traffic): a place 10 min away counts 37% as much as one next door,
+# 20 min away 14%. --trip-scale changes it, 0 turns it off.
+TRIP_SCALE = 600
 
 
 # ----------------------------------------------------------------------------
@@ -214,15 +230,20 @@ def make_demo_graph(n=20, spacing=150.0):
 # Landmarks: the destination prior P(d)
 # ----------------------------------------------------------------------------
 # OSM tag -> (weight, typical area in m²). The weight is roughly how many car
-# trips a day end at one typical place of that kind, relative to the others.
-# A polygon bigger or smaller than typical has its weight scaled by
-# sqrt(area / typical area), clipped to SIZE_FACTOR; None = no size scaling.
+# trips a day end at one typical place of that kind, in hundreds: a mall of
+# ~20k m² in OSM ~6k car arrivals a day (NorteShopping, 47k m²: ~35k visits
+# a day, ~70% by car, ~1.8 people per car -> ~14k); a hospital ~3k (staff
+# shifts, appointments, visits; a central one like São João ~7k); a
+# university faculty ~2k (many students come by metro or bus).
+# Rough estimates, not measured data: tune freely.
+# A polygon bigger or smaller than typical has its weight scaled by its size
+# (SIZE_SCALING); typical area None = no size scaling.
 # `True` matches any value of that key (every office=*).
 LANDMARKS = {
     ("aeroway", "terminal"):        (100, 40_000),
-    ("amenity", "hospital"):        (60, 30_000),
-    ("amenity", "university"):      (40, 20_000),
-    ("shop", "mall"):               (40, 20_000),
+    ("shop", "mall"):               (60, 20_000),
+    ("amenity", "hospital"):        (30, 30_000),
+    ("amenity", "university"):      (20, 20_000),
     ("leisure", "stadium"):         (20, None),
     ("railway", "station"):         (10, None),
     ("amenity", "college"):         (10, 5_000),
@@ -233,7 +254,18 @@ LANDMARKS = {
     ("office", True):               (2, None),
     ("amenity", "parking"):         (1, 1_000),
 }
-SIZE_FACTOR = (0.25, 3)
+# Size factor = (area / typical area) ** exponent, clipped to [low, high];
+# `unknown` for a place mapped as a point (no area): big places are nearly
+# always mapped with their outline, small ones often as a point.
+#   category -> (exponent, low, high, unknown)
+SIZE_SCALING = {
+    # sqrt: OSM outlines include grounds and car parks (a hospital's gardens),
+    # so area overstates traffic
+    "default":   (0.5, 0.25, 3, 0.5),
+    # shop floor, and so visits, grows with the building; the many small
+    # galleries in old Porto buildings get few car trips
+    "shop=mall": (1.0, 0.05, 3, 0.1),
+}
 
 
 def _category(key, value):
@@ -509,8 +541,13 @@ class LandmarkPrior:
     @staticmethod
     def _weight(category, area):
         w, typical = CATEGORY_WEIGHTS[category]
-        if typical and area and area > 0:
-            w *= float(np.clip(math.sqrt(area / typical), *SIZE_FACTOR))
+        if typical:
+            exponent, low, high, unknown = SIZE_SCALING.get(
+                category, SIZE_SCALING["default"])
+            if area and area > 0:
+                w *= float(np.clip((area / typical) ** exponent, low, high))
+            else:
+                w *= unknown
         return w
 
     def label(self, i):
@@ -853,7 +890,7 @@ class Predictor:
             raise ValueError(f"observed must be 'exit' or 'turn', not {observed!r}")
         return p_exit[np.array(obs)].sum(axis=0), best
 
-    def predict(self, route, *, beta=0.03, trip_scale=None, landmarks=None,
+    def predict(self, route, *, beta=BETA, trip_scale=TRIP_SCALE, landmarks=None,
                 observed="exit", cell_m=300):
         """
         P(destination | route) for every node.
@@ -861,7 +898,8 @@ class Predictor:
         route       edges (u, v, key): the road the car arrived on, then the
                     road it took at each junction (at least two edges)
         beta        driver rationality per second of detour
-        trip_scale  favour trips of about this many seconds (None = off)
+        trip_scale  favour destinations within about this many seconds of
+                    driving (see TRIP_SCALE; None or 0 = off)
         landmarks   a LandmarkPrior for P(d); None = uniform
         observed    'exit' or 'turn', see likelihood()
         cell_m      size of the squares in Result.cells
@@ -1088,11 +1126,12 @@ def main():
     ap.add_argument("--landmark-sigma", type=float, default=100,
                     help="how far a landmark's weight spreads to nearby "
                          "intersections, metres (default 100)")
-    ap.add_argument("--beta", type=float, default=0.03,
-                    help="driver rationality per second of detour (default 0.03: "
-                         "a 60 s detour is ~6x less likely)")
-    ap.add_argument("--trip-scale", type=float, default=None,
-                    help="favour trips of about this many seconds (default: off)")
+    ap.add_argument("--beta", type=float, default=BETA,
+                    help=f"driver rationality per second of detour (default {BETA}: "
+                         "a 60 s detour is ~36x less likely)")
+    ap.add_argument("--trip-scale", type=float, default=TRIP_SCALE,
+                    help="favour destinations within about this many seconds "
+                         f"of free-flow driving (default {TRIP_SCALE}; 0 = off)")
     ap.add_argument("--cell", type=float, default=300, help="region size, metres")
     ap.add_argument("--demo", action="store_true", help="synthetic grid, offline")
     ap.add_argument("--out", default="destination")

@@ -140,7 +140,7 @@ function settings() {
   const time = $("time").value || null;
   const trip = parseFloat($("trip").value);
   return {
-    beta: parseFloat($("beta").value) || 0.03,
+    beta: parseFloat($("beta").value) || 0.06,
     trip_scale: trip > 0 ? trip * 60 : null,
     landmarks: $("landmarks").checked,
     time,
