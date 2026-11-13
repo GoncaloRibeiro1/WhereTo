@@ -47,7 +47,7 @@ At a fork (the road splits in two, both branches roughly straight ahead) say
 Usage
 -----
 Real map (needs internet access to OpenStreetMap):
-    python turn_destination.py --lat 38.7223 --lon -9.1393 --heading 0 \
+    python whereto.py --lat 38.7223 --lon -9.1393 --heading 0 \
         --turn right left --radius 3000
 
   --lat/--lon   point at or near the first crossing (nearest intersection)
@@ -56,8 +56,8 @@ Real map (needs internet access to OpenStreetMap):
   --turn        one or more of: left | right | straight
 
 Cached city graph (download once, then reuse offline):
-    python turn_destination.py --build-graph porto.graphml
-    python turn_destination.py --graph porto.graphml --lat 41.1622 \
+    python whereto.py --build-graph porto.graphml
+    python whereto.py --graph porto.graphml --lat 41.1622 \
         --lon -8.5989 --heading 0 --turn right right
 
   --build-graph downloads the roads of --places (default: Porto, Matosinhos,
@@ -65,8 +65,8 @@ Cached city graph (download once, then reuse offline):
   --radius is then ignored.
 
 Landmark prior (download once, then reuse):
-    python turn_destination.py --build-landmarks porto_landmarks.geojson
-    python turn_destination.py --graph porto.graphml \
+    python whereto.py --build-landmarks porto_landmarks.geojson
+    python whereto.py --graph porto.graphml \
         --landmarks porto_landmarks.geojson --lat 41.1622 --lon -8.5989 \
         --heading 0 --turn right right
 
@@ -80,7 +80,7 @@ Landmark prior (download once, then reuse):
   at the weekend.
 
 Offline demo (synthetic city grid, no internet needed):
-    python turn_destination.py --demo --turn right left
+    python whereto.py --demo --turn right left
 
 Outputs: a PNG heatmap and a CSV of regions ranked by probability (and, with
 landmarks, a CSV of places ranked by probability).

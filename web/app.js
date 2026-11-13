@@ -1,4 +1,4 @@
-// Turn Destination map app. Talks to server.py (see its docstring for the API).
+// WhereTo map app. Talks to server.py (see its docstring for the API).
 //
 // Flow: click a road -> the GPS arrow is placed on it (/api/snap) -> pulsing
 // circles mark where the car can go next (/api/next) -> clicking one drives

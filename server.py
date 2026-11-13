@@ -1,5 +1,5 @@
 """
-Web server for the Turn Destination map app.
+Web server for the WhereTo map app.
 
     python server.py --graph porto.graphml --landmarks porto_landmarks.geojson
 
@@ -15,7 +15,7 @@ The app talks to three endpoints, all with coordinates as [lat, lon]:
                       where the driver has a choice again (pulsing circles)
   POST /api/predict   a route + settings -> heatmap squares, top places
 
-A route is a list of edges [u, v, key] (see turn_destination.route_nodes):
+A route is a list of edges [u, v, key] (see whereto.route_nodes):
 the road the arrow was placed on, then the edges of each option clicked.
 """
 
@@ -33,7 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from shapely.ops import substring
 
-import turn_destination as td
+import whereto as wt
 
 SNAP_MAX_M = 80      # a click further than this from any road is ignored
 CHAIN_MAX = 100      # safety limit when following roads without a choice
@@ -56,9 +56,9 @@ class RouteRequest(BaseModel):
 
 
 class Settings(BaseModel):
-    beta: float = Field(td.BETA, gt=0, description="driver rationality per second "
+    beta: float = Field(wt.BETA, gt=0, description="driver rationality per second "
                         "of detour (0.06: a 60 s detour is ~36x less likely)")
-    trip_scale: float | None = Field(td.TRIP_SCALE, ge=0, description="favour "
+    trip_scale: float | None = Field(wt.TRIP_SCALE, ge=0, description="favour "
                                      "destinations within about this many seconds "
                                      "of free-flow driving (0 or null = off)")
     landmarks: bool = Field(True, description="landmark prior (if the server "
@@ -83,8 +83,8 @@ class City:
 
     def __init__(self, graph_path, landmarks_path=None):
         print(f"Loading {graph_path} ...")
-        self.G = G = td.load_graph_file(graph_path)
-        self.predictor = td.Predictor(G)
+        self.G = G = wt.load_graph_file(graph_path)
+        self.predictor = wt.Predictor(G)
         self.landmarks_path = landmarks_path
         self._landmarks = OrderedDict()        # settings -> LandmarkPrior
         self.lock = threading.Lock()           # Predictor's cache isn't thread-safe
@@ -95,7 +95,7 @@ class City:
 
         # Every directed edge as a line in metres, in a spatial index for snapping
         self.edges = list(G.edges(keys=True))
-        self.lines = [shapely.LineString(td._edge_coords(G, u, v, G.edges[u, v, k]))
+        self.lines = [shapely.LineString(wt._edge_coords(G, u, v, G.edges[u, v, k]))
                       for u, v, k in self.edges]
         self.tree = shapely.STRtree(self.lines)
         self.edge_index = {e: i for i, e in enumerate(self.edges)}
@@ -125,11 +125,11 @@ class City:
         """The LandmarkPrior for these settings (cached), or None."""
         if not (s.landmarks and self.landmarks_path):
             return None
-        when = td.parse_when(s.time, s.day)
+        when = wt.parse_when(s.time, s.day)
         key = (when, s.landmark_floor, s.landmark_sigma)
         lm = self._landmarks.get(key)
         if lm is None:
-            lm = td.LandmarkPrior(self.G, self.landmarks_path, s.landmark_sigma,
+            lm = wt.LandmarkPrior(self.G, self.landmarks_path, s.landmark_sigma,
                                   s.landmark_floor, when)
             self._landmarks[key] = lm
             if len(self._landmarks) > 8:
@@ -145,7 +145,7 @@ def _edge_bearing_at(line, s):
         (x0, y0), (x1, y1) = line.coords[0], line.coords[-1]
     else:
         x0, y0, x1, y1 = a.x, a.y, b.x, b.y
-    return round(td._bearing(x0, y0, x1, y1), 1)
+    return round(wt._bearing(x0, y0, x1, y1), 1)
 
 
 def _all_exits(exits):
@@ -160,8 +160,8 @@ def junction_options(G, edge):
     Returns (kind, [(turn, Exit, [edges])]).
     """
     u, X, k = edge
-    in_bearing = td.arrival_bearing(G, u, X, G.edges[u, X, k])
-    exits, kind = td.exits_by_turn(G, X, u, in_bearing)
+    in_bearing = wt.arrival_bearing(G, u, X, G.edges[u, X, k])
+    exits, kind = wt.exits_by_turn(G, X, u, in_bearing)
     options = []
     for cls in ("left", "straight", "right"):
         for e in sorted(exits.get(cls, []), key=lambda e: e.delta):
@@ -171,8 +171,8 @@ def junction_options(G, edge):
                 if b in seen:
                     break                         # went round a loop
                 seen.add(b)
-                nxt = _all_exits(td.exits_by_turn(
-                    G, b, a, td.arrival_bearing(G, a, b, G.edges[a, b, kk]))[0])
+                nxt = _all_exits(wt.exits_by_turn(
+                    G, b, a, wt.arrival_bearing(G, a, b, G.edges[a, b, kk]))[0])
                 if len(nxt) != 1:
                     break                         # a real choice, or a dead end
                 chain.append((b, nxt[0].v, nxt[0].key))
@@ -184,7 +184,7 @@ def junction_options(G, edge):
 # The web app
 # ----------------------------------------------------------------------------
 def create_app(city: City) -> FastAPI:
-    app = FastAPI(title="Turn Destination",
+    app = FastAPI(title="WhereTo",
                   description="Where is the car going? See server.py.")
     G = city.G
 
@@ -195,7 +195,7 @@ def create_app(city: City) -> FastAPI:
             if not G.has_edge(*e):
                 raise HTTPException(400, f"Unknown road {list(e)}")
         try:
-            td.crossings_along(G, route)
+            wt.crossings_along(G, route)
         except ValueError as err:
             raise HTTPException(400, str(err))
         return route
@@ -206,7 +206,7 @@ def create_app(city: City) -> FastAPI:
         return {"bounds": city.bounds,
                 "landmarks": city.landmarks_path is not None,
                 "defaults": Settings().model_dump(),
-                "days": ["weekday"] + td.DAYS}
+                "days": ["weekday"] + wt.DAYS}
 
     @app.post("/api/snap")
     def snap(req: SnapRequest):
@@ -238,7 +238,7 @@ def create_app(city: City) -> FastAPI:
             ahead = substring(line, s, line.length)
             options.append({
                 "edge": list(e),
-                "name": td.road_name(G.edges[e]),
+                "name": wt.road_name(G.edges[e]),
                 "position": city.latlon([(p.x, p.y)])[0],
                 "bearing": _edge_bearing_at(line, s),
                 "ahead": city.latlon(ahead.coords if ahead.length > 0
@@ -263,11 +263,11 @@ def create_app(city: City) -> FastAPI:
             out.append({
                 "turn": cls,
                 "delta": round(e.delta, 1),
-                "name": td.road_name(e.data),
+                "name": wt.road_name(e.data),
                 "edges": [list(ce) for ce in chain],
                 "coords": coords,
                 "target": city.node_latlon(b),
-                "arrival_bearing": round(td.arrival_bearing(G, a, b,
+                "arrival_bearing": round(wt.arrival_bearing(G, a, b,
                                                             G.edges[a, b, kk]), 1),
             })
         return {"junction": {"node": last[1], "position": city.node_latlon(last[1]),
@@ -303,7 +303,7 @@ def create_app(city: City) -> FastAPI:
         places = []
         if landmarks is not None:
             top = res.places[:TOP_PLACES]
-            lonlat = td._to_lonlat(landmarks, [i for i, _ in top])
+            lonlat = wt._to_lonlat(landmarks, [i for i, _ in top])
             places = [{"p": p, "name": landmarks.names[i],
                        "category": landmarks.categories[i],
                        "position": [round(lat, 6), round(lon, 6)]}
@@ -314,7 +314,7 @@ def create_app(city: City) -> FastAPI:
         return JSONResponse({
             "crossings": [{"node": c.node, "position": city.node_latlon(c.node),
                            "kind": c.kind, "turn": c.turn,
-                           "onto": td.road_name(c.taken.data),
+                           "onto": wt.road_name(c.taken.data),
                            "options": len(_all_exits(c.exits))}
                           for c in res.crossings],
             "cells": cells_out,
@@ -329,9 +329,9 @@ def create_app(city: City) -> FastAPI:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Run the Turn Destination map app.")
+    ap = argparse.ArgumentParser(description="Run the WhereTo map app.")
     ap.add_argument("--graph", default="porto.graphml",
-                    help="road network from turn_destination.py --build-graph")
+                    help="road network from whereto.py --build-graph")
     ap.add_argument("--landmarks", default="porto_landmarks.geojson",
                     help="landmarks from --build-landmarks ('' = none)")
     ap.add_argument("--host", default="127.0.0.1")

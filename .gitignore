@@ -6,11 +6,11 @@ __pycache__/
 cache/
 
 # Road network built by --build-graph (large; rebuild with
-#   python turn_destination.py --build-graph porto.graphml)
+#   python whereto.py --build-graph porto.graphml)
 *.graphml
 
 # Landmarks built by --build-landmarks (rebuild with
-#   python turn_destination.py --build-landmarks porto_landmarks.geojson)
+#   python whereto.py --build-landmarks porto_landmarks.geojson)
 *_landmarks.geojson
 
 # Generated outputs
